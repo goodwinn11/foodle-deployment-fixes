@@ -1,0 +1,172 @@
+version: '3.8'
+
+# Optimized Docker Compose configuration with resource limits
+
+services:
+  api:
+    image: foodle-api:latest
+    container_name: foodle_api
+    deploy:
+      resources:
+        limits:
+          memory: 1024m  # Reduced from 1536m
+          cpus: '1.0'
+        reservations:
+          memory: 512m
+          cpus: '0.5'
+    environment:
+      - PHP_MEMORY_LIMIT=512M
+      - PHP_MAX_EXECUTION_TIME=60
+      - PHP_OPCACHE_ENABLE=1
+    volumes:
+      - ./php-opcache-optimization.ini:/etc/php83/conf.d/99-opcache.ini:ro
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1/v2/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  database:
+    image: mariadb:11.2
+    container_name: foodle_hosted_db
+    deploy:
+      resources:
+        limits:
+          memory: 768m  # Reduced from 1024m
+          cpus: '0.8'
+        reservations:
+          memory: 384m
+          cpus: '0.4'
+    volumes:
+      - ./mariadb-optimization.cnf:/etc/mysql/conf.d/optimization.cnf:ro
+      - db_data:/var/lib/mysql
+    environment:
+      - MARIADB_BUFFER_POOL_SIZE=512M
+      - MARIADB_MAX_CONNECTIONS=100
+
+  panel:
+    image: foodle-panel:latest
+    container_name: foodle_panel
+    deploy:
+      resources:
+        limits:
+          memory: 256m  # Reduced from 512m (static nginx)
+          cpus: '0.5'
+        reservations:
+          memory: 128m
+          cpus: '0.2'
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  cache:
+    image: redis:7.2-alpine
+    container_name: foodle_hosted_cache
+    deploy:
+      resources:
+        limits:
+          memory: 128m  # Reduced from 256m
+          cpus: '0.3'
+        reservations:
+          memory: 64m
+          cpus: '0.1'
+    command: >
+      redis-server
+      --maxmemory 100mb
+      --maxmemory-policy allkeys-lru
+      --save ""
+      --appendonly no
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+
+  keydb:
+    image: eqalpha/keydb:alpine
+    container_name: foodle_hosted_keydb
+    deploy:
+      resources:
+        limits:
+          memory: 128m  # Reduced from 256m
+          cpus: '0.3'
+        reservations:
+          memory: 64m
+          cpus: '0.1'
+    command: >
+      keydb-server
+      --maxmemory 100mb
+      --maxmemory-policy allkeys-lru
+      --save ""
+
+  rabbitmq:
+    image: rabbitmq:3.12-management-alpine
+    container_name: foodle_hosted_rabbitmq
+    deploy:
+      resources:
+        limits:
+          memory: 384m  # Increased from 256m for queue processing
+          cpus: '0.5'
+        reservations:
+          memory: 256m
+          cpus: '0.3'
+    environment:
+      - RABBITMQ_VM_MEMORY_HIGH_WATERMARK=0.6
+      - RABBITMQ_DISK_FREE_LIMIT=1GB
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "check_running"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  website:
+    image: foodle-website:latest
+    container_name: foodle_website
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+          cpus: '0.5'
+        reservations:
+          memory: 128m
+          cpus: '0.2'
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:5173/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  proxy:
+    image: nginx:alpine
+    container_name: foodle_proxy
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+          cpus: '0.3'
+        reservations:
+          memory: 64m
+          cpus: '0.1'
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  db_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/mysql
+
+networks:
+  default:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24

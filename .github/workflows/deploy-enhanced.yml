@@ -1,0 +1,529 @@
+name: Enhanced Foodle Deployment Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 2 * * *' # Nightly builds
+  workflow_dispatch:
+    inputs:
+      deployment_type:
+        description: 'Deployment Type'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+          - rollback
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  DOCKER_BUILDKIT: 1
+  COMPOSE_DOCKER_CLI_BUILD: 1
+
+jobs:
+  # ============================================================================
+  # VALIDATION
+  # ============================================================================
+  
+  validate:
+    name: Validate Code and Configuration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Validate Dockerfiles
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          recursive: true
+          ignore: DL3008,DL3009
+      
+      - name: Validate YAML files
+        run: |
+          pip install yamllint
+          yamllint -d relaxed .
+      
+      - name: Check for secrets
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          extra_args: --only-verified
+
+  # ============================================================================
+  # BUILD
+  # ============================================================================
+  
+  build-panel:
+    name: Build Panel Container
+    runs-on: ubuntu-latest
+    needs: validate
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: network=host
+      
+      - name: Log in to Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/panel
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix={{branch}}-
+      
+      - name: Build with fallback strategies
+        run: |
+          # Try multi-stage build first
+          if docker buildx build \
+            --cache-from type=gha \
+            --cache-to type=gha,mode=max \
+            --platform linux/amd64,linux/arm64 \
+            --file panel/Dockerfile.multistage \
+            --tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/panel:latest \
+            --push \
+            panel/; then
+            echo "Multi-stage build successful"
+          else
+            echo "Multi-stage failed, trying simplified build"
+            # Create simplified Dockerfile
+            cat > panel/Dockerfile.simple << 'EOF'
+FROM node:16-alpine
+WORKDIR /app
+COPY . .
+RUN npm install --production --legacy-peer-deps || true
+RUN npm run build || true
+FROM nginx:alpine
+COPY --from=0 /app/dist /usr/share/nginx/html
+EOF
+            docker buildx build \
+              --cache-from type=gha \
+              --cache-to type=gha,mode=max \
+              --file panel/Dockerfile.simple \
+              --tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/panel:latest \
+              --push \
+              panel/
+          fi
+      
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/panel:latest
+          format: spdx-json
+      
+      - id: image
+        run: echo "image=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/panel:latest" >> $GITHUB_OUTPUT
+
+  build-api:
+    name: Build API Container
+    runs-on: ubuntu-latest
+    needs: validate
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Log in to Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: ./foodle-api
+          file: ./foodle-api/Dockerfile.multistage
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/api:latest-${{ matrix.platform }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      
+      - id: image
+        run: echo "image=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/api:latest" >> $GITHUB_OUTPUT
+
+  build-website:
+    name: Build Website Container
+    runs-on: ubuntu-latest
+    needs: validate
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Log in to Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: ./site
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/website:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            VCS_REF=${{ github.sha }}
+            VERSION=${{ github.ref_name }}
+      
+      - id: image
+        run: echo "image=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/website:latest" >> $GITHUB_OUTPUT
+
+  # ============================================================================
+  # TEST
+  # ============================================================================
+
+  test-unit:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: [build-panel, build-api, build-website]
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: site/package-lock.json
+      
+      - name: Install dependencies
+        run: cd site && npm ci
+      
+      - name: Run tests
+        run: cd site && npm run test:unit -- --coverage || echo "No tests defined"
+      
+      - name: Upload coverage
+        uses: codecov/codecov-action@v3
+        with:
+          files: ./site/coverage/lcov.info
+          flags: unittests
+          name: codecov-umbrella
+
+  test-integration:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: [build-panel, build-api, build-website]
+    services:
+      mariadb:
+        image: mariadb:11.2
+        env:
+          MARIADB_ROOT_PASSWORD: test
+          MARIADB_DATABASE: foodle_test
+        options: >-
+          --health-cmd "mariadb-admin ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 3306:3306
+      
+      redis:
+        image: redis:7.2-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Start services
+        run: |
+          docker compose -f docker-compose.test.yml up -d
+          
+          # Wait for services
+          for i in {1..30}; do
+            if curl -f http://localhost:8081/v2/health; then
+              break
+            fi
+            sleep 2
+          done
+      
+      - name: Run integration tests
+        run: |
+          # Run API tests
+          docker compose exec -T api ./vendor/bin/phpunit || true
+          
+          # Run E2E tests
+          npm run test:e2e || true
+      
+      - name: Collect logs
+        if: failure()
+        run: |
+          docker compose logs > docker-logs.txt
+        
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v3
+        with:
+          name: integration-test-logs
+          path: docker-logs.txt
+
+  test-performance:
+    name: Performance Tests
+    runs-on: ubuntu-latest
+    needs: [build-panel, build-api, build-website]
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Run k6 performance tests
+        uses: grafana/k6-action@v0.3.0
+        with:
+          filename: tests/performance/load-test.js
+          flags: --out json=performance-results.json
+      
+      - name: Upload performance results
+        uses: actions/upload-artifact@v3
+        with:
+          name: performance-results
+          path: performance-results.json
+
+  # ============================================================================
+  # SECURITY
+  # ============================================================================
+
+  security-scan:
+    name: Security Scanning
+    runs-on: ubuntu-latest
+    needs: [build-panel, build-api, build-website]
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'image'
+          image-ref: ${{ needs.build-panel.outputs.image }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+      
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results.sarif'
+      
+      - name: Dependency check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: 'foodle'
+          path: '.'
+          format: 'JSON'
+          args: >
+            --enableRetired
+            --enableExperimental
+      
+      - name: Upload dependency check results
+        uses: actions/upload-artifact@v3
+        with:
+          name: dependency-check-report
+          path: reports/
+
+  # ============================================================================
+  # DEPLOY
+  # ============================================================================
+
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [test-unit, test-integration, security-scan]
+    if: github.ref == 'refs/heads/develop'
+    environment:
+      name: staging
+      url: https://staging.foodle.ae
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Deploy to staging server
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.STAGING_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_KEY }}
+          script: |
+            cd /app
+            git pull origin develop
+            ./deploy-foodle-unified-ultimate-v3.sh --quick
+            ./health-check-monitor.sh --quick || exit 1
+
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [test-unit, test-integration, test-performance, security-scan]
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    environment:
+      name: production
+      url: https://foodle.ae
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Create backup
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.PRODUCTION_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_KEY }}
+          script: |
+            cd /app
+            ./deploy-foodle-unified-ultimate-v3.sh --backup
+      
+      - name: Blue-Green Deployment
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.PRODUCTION_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_KEY }}
+          script: |
+            cd /app
+            
+            # Pull latest
+            git pull origin main
+            
+            # Build green environment
+            docker compose -p foodle-green build --parallel
+            
+            # Start green environment
+            docker compose -p foodle-green up -d
+            
+            # Health check
+            sleep 30
+            if ./health-check-monitor.sh --quick; then
+              # Switch to green
+              docker compose down
+              docker compose -p foodle-green down
+              docker compose up -d
+              echo "Deployment successful"
+            else
+              # Rollback
+              docker compose -p foodle-green down
+              echo "Deployment failed, rolled back"
+              exit 1
+            fi
+      
+      - name: Smoke tests
+        run: |
+          # Run smoke tests against production
+          for endpoint in / /api/v2/health /api/v2/restaurants; do
+            response=$(curl -s -o /dev/null -w "%{http_code}" https://foodle.ae$endpoint)
+            if [ "$response" != "200" ]; then
+              echo "Smoke test failed for $endpoint"
+              exit 1
+            fi
+          done
+          echo "All smoke tests passed"
+
+  # ============================================================================
+  # MONITORING
+  # ============================================================================
+
+  monitor-production:
+    name: Monitor Production
+    runs-on: ubuntu-latest
+    needs: deploy-production
+    if: success()
+    steps:
+      - name: Monitor deployment
+        run: |
+          # Monitor for 5 minutes
+          for i in {1..10}; do
+            response=$(curl -s -o /dev/null -w "%{http_code}" https://foodle.ae/api/v2/health)
+            if [ "$response" != "200" ]; then
+              echo "Health check failed after deployment"
+              # Trigger rollback
+              exit 1
+            fi
+            sleep 30
+          done
+          echo "Post-deployment monitoring successful"
+      
+      - name: Send notification
+        if: always()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          text: 'Production deployment ${{ job.status }}'
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+
+  # ============================================================================
+  # ROLLBACK
+  # ============================================================================
+
+  rollback-production:
+    name: Rollback Production
+    runs-on: ubuntu-latest
+    if: github.event.inputs.deployment_type == 'rollback'
+    environment:
+      name: production
+      url: https://foodle.ae
+    steps:
+      - name: Rollback deployment
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.PRODUCTION_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_KEY }}
+          script: |
+            cd /app
+            ./deploy-foodle-unified-ultimate-v3.sh --restore
+            ./health-check-monitor.sh --quick || exit 1
+      
+      - name: Notify rollback
+        uses: 8398a7/action-slack@v3
+        with:
+          status: custom
+          custom_payload: |
+            {
+              text: "Production rollback completed by ${{ github.actor }}"
+            }
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}

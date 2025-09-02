@@ -1,0 +1,242 @@
+version: '3.8'
+
+# Security-hardened Docker Compose configuration
+
+networks:
+  frontend:
+    driver: bridge
+    internal: false
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+  backend:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.21.0.0/24
+  database:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.22.0.0/24
+
+secrets:
+  db_password:
+    file: ./secrets/db_password.txt
+  db_root_password:
+    file: ./secrets/db_root_password.txt
+  jwt_secret:
+    file: ./secrets/jwt_secret.txt
+  rabbitmq_password:
+    file: ./secrets/rabbitmq_password.txt
+
+services:
+  api:
+    image: foodle-api:secure
+    container_name: foodle_api
+    networks:
+      - frontend
+      - backend
+      - database
+    secrets:
+      - db_password
+      - jwt_secret
+      - rabbitmq_password
+    environment:
+      - DB_PASS_FILE=/run/secrets/db_password
+      - JWT_SECRET_FILE=/run/secrets/jwt_secret
+      - RABBITMQ_PASS_FILE=/run/secrets/rabbitmq_password
+    deploy:
+      resources:
+        limits:
+          memory: 1024m
+          cpus: '1.0'
+    security_opt:
+      - no-new-privileges:true
+      - apparmor:docker-default
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/tmp
+    volumes:
+      - ./data/api/cache:/var/cache:rw
+      - ./data/api/logs:/var/log:rw
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1/v2/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  database:
+    image: mariadb:11.2
+    container_name: foodle_hosted_db
+    networks:
+      - database
+    secrets:
+      - db_password
+      - db_root_password
+    environment:
+      - MARIADB_ROOT_PASSWORD_FILE=/run/secrets/db_root_password
+      - MARIADB_PASSWORD_FILE=/run/secrets/db_password
+      - MARIADB_DATABASE=foodle
+      - MARIADB_USER=foodle
+    deploy:
+      resources:
+        limits:
+          memory: 768m
+          cpus: '0.8'
+    security_opt:
+      - no-new-privileges:true
+      - seccomp:unconfined
+    volumes:
+      - db_data:/var/lib/mysql:rw
+      - ./mariadb-optimization.cnf:/etc/mysql/conf.d/optimization.cnf:ro
+    healthcheck:
+      test: ["CMD", "mariadb-admin", "ping", "-h", "localhost"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  panel:
+    image: foodle-panel:secure
+    container_name: foodle_panel
+    networks:
+      - frontend
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+          cpus: '0.5'
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/log/nginx
+      - /var/run
+    volumes:
+      - ./nginx-security.conf:/etc/nginx/nginx.conf:ro
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  cache:
+    image: redis:7.2-alpine
+    container_name: foodle_hosted_cache
+    networks:
+      - backend
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+          cpus: '0.3'
+    security_opt:
+      - no-new-privileges:true
+    command: >
+      redis-server
+      --maxmemory 100mb
+      --maxmemory-policy allkeys-lru
+      --protected-mode yes
+      --bind 0.0.0.0
+      --requirepass ${REDIS_PASSWORD:-StrongRedisPassword123!}
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+
+  rabbitmq:
+    image: rabbitmq:3.12-management-alpine
+    container_name: foodle_hosted_rabbitmq
+    networks:
+      - backend
+    secrets:
+      - rabbitmq_password
+    environment:
+      - RABBITMQ_DEFAULT_USER=foodle
+      - RABBITMQ_DEFAULT_PASS_FILE=/run/secrets/rabbitmq_password
+      - RABBITMQ_VM_MEMORY_HIGH_WATERMARK=0.6
+    deploy:
+      resources:
+        limits:
+          memory: 384m
+          cpus: '0.5'
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq:rw
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "check_running"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  website:
+    image: foodle-website:secure
+    container_name: foodle_website
+    networks:
+      - frontend
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+          cpus: '0.5'
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:5173/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  proxy:
+    image: nginx:alpine
+    container_name: foodle_proxy
+    networks:
+      - frontend
+    ports:
+      - "80:80"
+      - "443:443"
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+          cpus: '0.3'
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/log/nginx
+      - /var/run
+    volumes:
+      - ./nginx-security.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  db_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/mysql
+  rabbitmq_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/rabbitmq
